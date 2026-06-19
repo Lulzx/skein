@@ -17,11 +17,12 @@
 //!   * Comms tolerance        — neighbor "packets" are dropped probabilistically;
 //!                              behavior degrades gracefully, never collapses.
 //!
-//! Controls:  [Space] pause      [G] goal-seek    [L] comms links   [N] noise
-//!            [E] estimator view [O] avoidance    [C] cooperative   [P] perception
-//!            [R] re-scatter     [Esc] quit
+//! Controls:  drag/scroll orbit+zoom   [Space] pause      [G] goal-seek   [L] links
+//!            [N] noise   [E] estimator view   [O] avoidance   [C] cooperative
+//!            [P] perception   [R] re-scatter   [Esc] quit
 
 use avian3d::prelude::*;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 use rand::Rng;
 use std::collections::HashMap;
@@ -396,6 +397,20 @@ struct Goal {
 #[derive(Resource, Default)]
 struct Tick(u64);
 
+/// Orbit-camera state: left-drag rotates, scroll zooms, idle slowly auto-rotates.
+#[derive(Resource)]
+struct OrbitCam {
+    yaw: f32,
+    pitch: f32,
+    radius: f32,
+}
+
+impl Default for OrbitCam {
+    fn default() -> Self {
+        Self { yaw: 0.0, pitch: 0.38, radius: 20.0 }
+    }
+}
+
 /// Fixed beacons at known world positions (e.g. UWB anchors), used by every
 /// drone's self-localization EKF to bound odometry drift.
 #[derive(Resource, Default)]
@@ -498,6 +513,7 @@ fn main() {
         .insert_resource(Obstacles::default())
         .insert_resource(Goal { pos: Vec3::new(0.0, 8.0, 0.0) })
         .init_resource::<Anchors>()
+        .init_resource::<OrbitCam>()
         .init_resource::<Landmarks>()
         .insert_resource(LandmarkMap(vec![
             LandmarkEst { pos: Vec3::ZERO, cov: Mat3n::identity() * 100.0, seen: false };
@@ -1802,12 +1818,31 @@ fn drone_emissive(informed: bool, knows_goal: bool, speed_t: f32) -> LinearRgba 
     }
 }
 
-fn orbit_camera(time: Res<Time>, mut cam: Query<&mut Transform, With<Camera3d>>) {
-    let t = time.elapsed_secs() * 0.1;
-    let r = 20.0;
+fn orbit_camera(
+    time: Res<Time>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    mut orbit: ResMut<OrbitCam>,
+    mut cam: Query<&mut Transform, With<Camera3d>>,
+) {
+    let target = Vec3::new(0.0, 8.5, 0.0);
+    if buttons.pressed(MouseButton::Left) {
+        // Drag to look around.
+        orbit.yaw -= motion.delta.x * 0.006;
+        orbit.pitch = (orbit.pitch - motion.delta.y * 0.006).clamp(-1.45, 1.45);
+    } else {
+        // Idle: a gentle automatic sweep.
+        orbit.yaw += time.delta_secs() * 0.1;
+    }
+    // Scroll to zoom.
+    orbit.radius = (orbit.radius - scroll.delta.y * 1.5).clamp(6.0, 45.0);
+
+    let cp = orbit.pitch.cos();
+    let dir = Vec3::new(orbit.yaw.sin() * cp, orbit.pitch.sin(), orbit.yaw.cos() * cp);
     for mut tf in &mut cam {
-        tf.translation = Vec3::new(t.sin() * r, 11.0, t.cos() * r);
-        tf.look_at(Vec3::new(0.0, 8.5, 0.0), Vec3::Y);
+        tf.translation = target + dir * orbit.radius;
+        tf.look_at(target, Vec3::Y);
     }
 }
 

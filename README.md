@@ -29,8 +29,9 @@ cargo test
 
 ## Controls
 
-| Key       | Action |
+| Control   | Action |
 |-----------|--------|
+| **Drag** / **scroll** | Orbit the camera / zoom (left-drag to rotate; idle auto-rotates) |
 | `Space`   | Pause / resume |
 | `G`       | Toggle goal-seeking (emergent flocking vs. directed migration) |
 | `L`       | Toggle the **comms graph** overlay (who can sense whom) |
