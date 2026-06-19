@@ -44,9 +44,12 @@ cargo test
 
 ## Reading the scene
 
-- **Drones** — *orange* = informed (direct goal observers), *green* = learned the
+- **Drones** — little quadrotors (X-frame + spinning rotors), colored by goal
+  knowledge: *orange* = informed (direct goal observers), *green* = learned the
   goal via gossip, *blue* = still goal-blind. Watch the green consensus wave sweep
   outward. Brightness encodes speed.
+- The analytical overlays (estimator ellipsoids, comms graph) are **off by
+  default** for a clean view — press `E` and `L` to reveal them.
 - **Green sphere** = moving goal · **red box** = moving obstacle · **gray
   cylinders** = static obstacles · **cyan cubes** = fixed UWB anchors (clustered
   to one side) · **purple cubes** = unknown landmarks the swarm maps.

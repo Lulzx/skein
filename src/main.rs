@@ -38,12 +38,13 @@ const CEIL_Y: f32 = 16.0;
 
 const DRONE_RADIUS: f32 = 0.28;
 const MAX_SPEED: f32 = 7.0;
+const ROTOR_SPEED: f32 = 40.0; // rad/s, visual rotor-blade spin
 
 // Quadrotor dynamics: thrust acts along the (tilt-limited) body axis and must
 // fight real gravity; the battery caps available thrust and drains with use.
 const GRAVITY_ACCEL: f32 = 9.81; // m/s^2
 const THRUST_MAX: f32 = 26.0; // m/s^2 of thrust at full battery (~2.6 g)
-const TILT_RATE: f32 = 8.0; // rad/s, how fast the quad can redirect its thrust
+const TILT_ACCEL_RATE: f32 = 45.0; // m/s^3, how fast horizontal thrust can change (attitude lag)
 const VEL_KP: f32 = 4.0; // velocity-controller gain (1/s)
 const MAX_LATERAL_ACCEL: f32 = 14.0; // m/s^2 cap on commanded steering accel
 const BATTERY_DRAIN: f32 = 0.0016; // per (m/s^2 thrust)·s
@@ -55,7 +56,7 @@ const BATTERY_MIN: f32 = 0.55; // floor — still leaves enough thrust to hover
 // velocity-obstacle avoidance stage, not here).
 const W_ALIGNMENT: f32 = 0.9; // match the flock's average velocity
 const W_COHESION: f32 = 0.7; // pull toward the local centroid
-const W_GOAL: f32 = 1.0; // informed drones cruise toward the goal
+const W_GOAL: f32 = 1.7; // cruise toward the (believed) goal
 const W_BOUNDARY: f32 = 10.0; // firm inward steer near walls (no hard walls exist)
 
 const GOAL_ARRIVE_RADIUS: f32 = 4.0;
@@ -64,7 +65,7 @@ const CRUISE_SPEED: f32 = 5.5;
 // ORCA-style collision avoidance (deterministic half-plane projection).
 const VO_TIME_HORIZON: f32 = 2.5; // s, how far ahead collisions are anticipated
 const VO_SIGMA_INFLATE: f32 = 2.0; // safety radius added per 1-sigma of estimate error
-const VO_BASE_MARGIN: f32 = 0.5; // extra clearance beyond the two body radii (m)
+const VO_BASE_MARGIN: f32 = 0.9; // extra clearance beyond the two body radii (m)
 
 const PACKET_LOSS: f32 = 0.08; // probability a neighbor measurement is dropped
 const ACTUATION_NOISE_STD: f32 = 2.0; // m/s^2, on applied thrust
@@ -118,10 +119,19 @@ struct Drone {
 /// since the airframe must physically tilt) and remaining battery charge.
 #[derive(Component)]
 struct Quad {
-    thrust_dir: Vec3,
+    horiz: Vec3,       // current (attitude-lagged) horizontal thrust acceleration
     battery: f32,
     last_thrust: Vec3, // held and re-applied on ticks the drone doesn't re-plan
 }
+
+/// Per-drone material whose color encodes the drone's goal-knowledge state.
+/// Lives on the parent entity; the visual sub-meshes share this handle.
+#[derive(Component)]
+struct ColorMat(Handle<StandardMaterial>);
+
+/// Marker for a spinning rotor mesh (a child of a drone).
+#[derive(Component)]
+struct Rotor;
 
 #[derive(Component)]
 struct MovingObstacle;
@@ -437,9 +447,9 @@ impl Default for SimState {
         Self {
             paused: false,
             goal_seek: true,
-            show_links: true,
+            show_links: false,
             noise: true,
-            show_estimator: true,
+            show_estimator: false,
             avoidance: true,
             cooperative: true,
             perception: 5.0,
@@ -512,6 +522,7 @@ fn main() {
                 draw_gizmos,
                 draw_estimator,
                 update_drone_visuals,
+                spin_rotors,
                 update_hud,
             ),
         )
@@ -679,8 +690,28 @@ fn setup(
     }
     commands.insert_resource(Landmarks(landmark_positions));
 
-    // Drones
-    let drone_mesh = meshes.add(Sphere::new(DRONE_RADIUS));
+    // Drones — built as little quadrotors: a glowing body, an X of arms, and
+    // four spinning rotors. Shared meshes/material across all drones; only the
+    // state-color material is per-drone (so it can be recolored live).
+    let body_mesh = meshes.add(Cuboid::new(0.42, 0.14, 0.42));
+    let arm_mesh = meshes.add(Cuboid::new(0.92, 0.06, 0.085));
+    let hub_mesh = meshes.add(Cylinder::new(0.19, 0.03));
+    let blade_mesh = meshes.add(Cuboid::new(0.36, 0.018, 0.05));
+    let dark_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.04, 0.05, 0.07),
+        metallic: 0.8,
+        perceptual_roughness: 0.35,
+        ..default()
+    });
+    let arm = 0.32; // rotor offset from the hub
+    let rotor_offsets = [
+        Vec3::new(arm, 0.085, arm),
+        Vec3::new(arm, 0.085, -arm),
+        Vec3::new(-arm, 0.085, arm),
+        Vec3::new(-arm, 0.085, -arm),
+    ];
+    let f4 = std::f32::consts::FRAC_PI_4;
+
     let n_informed = (N_DRONES as f32 * INFORMED_FRACTION).round() as usize;
     for id in 0..N_DRONES {
         let informed = id < n_informed;
@@ -690,42 +721,73 @@ fn setup(
             rng.gen_range(4.0..11.0),
             rng.gen_range(-11.0..-6.0),
         );
-        let mat = materials.add(StandardMaterial {
+        let color_mat = materials.add(StandardMaterial {
             base_color: drone_color(informed, informed, 0.0),
             emissive: drone_emissive(informed, informed, 0.0),
             ..default()
         });
-        commands.spawn((
-            Mesh3d(drone_mesh.clone()),
-            MeshMaterial3d(mat),
-            Transform::from_translation(pos),
-            RigidBody::Dynamic,
-            Collider::sphere(DRONE_RADIUS),
-            LinearDamping(0.6),
-            Restitution::new(0.1),
-            LinearVelocity(Vec3::ZERO),
-            Drone {
-                id,
-                informed,
-                period: rng.gen_range(1..=4), // asynchronous: 64 Hz down to 16 Hz
-                phase: rng.gen_range(0..4),
-            },
-            Beliefs::default(),
-            GoalBelief::default(),
-            Quad {
-                thrust_dir: Vec3::Y,
-                battery: 1.0,
-                last_thrust: Vec3::Y * GRAVITY_ACCEL,
-            },
-            SelfLoc::new(
-                pos,
-                Vec3::new(
-                    rng.gen_range(-ODOM_BIAS_MAX..ODOM_BIAS_MAX),
-                    rng.gen_range(-ODOM_BIAS_MAX..ODOM_BIAS_MAX),
-                    rng.gen_range(-ODOM_BIAS_MAX..ODOM_BIAS_MAX),
+        commands
+            .spawn((
+                Transform::from_translation(pos),
+                Visibility::default(),
+                RigidBody::Dynamic,
+                Collider::sphere(DRONE_RADIUS),
+                LockedAxes::ROTATION_LOCKED, // keep the quad level and readable
+                LinearDamping(0.6),
+                Restitution::new(0.1),
+                LinearVelocity(Vec3::ZERO),
+                Drone {
+                    id,
+                    informed,
+                    period: rng.gen_range(1..=4), // asynchronous: 64 Hz down to 16 Hz
+                    phase: rng.gen_range(0..4),
+                },
+                Beliefs::default(),
+                GoalBelief::default(),
+                Quad {
+                    horiz: Vec3::ZERO,
+                    battery: 1.0,
+                    last_thrust: Vec3::Y * GRAVITY_ACCEL,
+                },
+                ColorMat(color_mat.clone()),
+                SelfLoc::new(
+                    pos,
+                    Vec3::new(
+                        rng.gen_range(-ODOM_BIAS_MAX..ODOM_BIAS_MAX),
+                        rng.gen_range(-ODOM_BIAS_MAX..ODOM_BIAS_MAX),
+                        rng.gen_range(-ODOM_BIAS_MAX..ODOM_BIAS_MAX),
+                    ),
                 ),
-            ),
-        ));
+            ))
+            .with_children(|c| {
+                // Glowing central body — carries the state color.
+                c.spawn((Mesh3d(body_mesh.clone()), MeshMaterial3d(color_mat.clone())));
+                // Two crossed arms (X configuration).
+                c.spawn((
+                    Mesh3d(arm_mesh.clone()),
+                    MeshMaterial3d(dark_mat.clone()),
+                    Transform::from_rotation(Quat::from_rotation_y(f4)),
+                ));
+                c.spawn((
+                    Mesh3d(arm_mesh.clone()),
+                    MeshMaterial3d(dark_mat.clone()),
+                    Transform::from_rotation(Quat::from_rotation_y(-f4)),
+                ));
+                // A dark hub + a colored spinning blade at each rotor.
+                for off in rotor_offsets {
+                    c.spawn((
+                        Mesh3d(hub_mesh.clone()),
+                        MeshMaterial3d(dark_mat.clone()),
+                        Transform::from_translation(off),
+                    ));
+                    c.spawn((
+                        Mesh3d(blade_mesh.clone()),
+                        MeshMaterial3d(color_mat.clone()),
+                        Transform::from_translation(off + Vec3::Y * 0.02),
+                        Rotor,
+                    ));
+                }
+            });
     }
 
     // HUD
@@ -1317,26 +1379,30 @@ fn actuate_swarm(
                 gauss(&mut rng, act_std),
             );
 
-        // --- Quadrotor: realize that as tilt- and battery-limited thrust -------
-        // Net accel = thrust + gravity, so the thrust must also counter gravity.
-        let desired_thrust = accel + Vec3::Y * GRAVITY_ACCEL;
+        // --- Quadrotor: decoupled altitude + tilt-limited horizontal thrust ---
+        // Vertical (collective) thrust holds altitude precisely and counters
+        // gravity; horizontal thrust comes from tilting, which the airframe can
+        // only do so fast (attitude lag) — so it slews toward the demand.
+        let horiz_demand = Vec3::new(accel.x, 0.0, accel.z);
+        let dh = (horiz_demand - quad.horiz).clamp_length_max(TILT_ACCEL_RATE * dt);
+        quad.horiz += dh;
+        let vert = accel.y + GRAVITY_ACCEL;
+        let mut thrust = quad.horiz + Vec3::Y * vert;
+
+        // Battery-limited total thrust; if over budget, shed horizontal (tilt
+        // back toward level) to protect altitude.
         let thrust_max = THRUST_MAX * (0.6 + 0.4 * quad.battery);
-        let mag = desired_thrust.length().min(thrust_max);
-        let target_dir = desired_thrust.normalize_or(Vec3::Y);
-        // The airframe can only re-tilt so fast, so the thrust direction lags.
-        let angle = quad.thrust_dir.angle_between(target_dir);
-        let max_step = TILT_RATE * dt;
-        quad.thrust_dir = if angle > max_step && angle > 1e-4 {
-            quad.thrust_dir.lerp(target_dir, max_step / angle).normalize_or(Vec3::Y)
-        } else {
-            target_dir
-        };
-        let thrust = quad.thrust_dir * mag;
+        if thrust.length() > thrust_max {
+            let v = thrust.y.min(thrust_max);
+            let h_budget = (thrust_max * thrust_max - v * v).max(0.0).sqrt();
+            thrust = quad.horiz.clamp_length_max(h_budget) + Vec3::Y * v;
+        }
         quad.last_thrust = thrust; // remembered for the held (async) ticks
 
         // Battery drains with thrust, trickle-recharges, and never fully dies.
-        quad.battery =
-            (quad.battery - BATTERY_DRAIN * mag * dt + BATTERY_RECHARGE * dt).clamp(BATTERY_MIN, 1.0);
+        quad.battery = (quad.battery - BATTERY_DRAIN * thrust.length() * dt
+            + BATTERY_RECHARGE * dt)
+            .clamp(BATTERY_MIN, 1.0);
         battery_sum += quad.battery;
         battery_n += 1.0;
 
@@ -1690,17 +1756,28 @@ fn draw_covariance(gizmos: &mut Gizmos, center: Vec3, cov: Mat3n) {
 /// tracks speed. This makes the consensus front visible as it sweeps the swarm.
 fn update_drone_visuals(
     snap: Res<Snapshot>,
-    drones: Query<(&Drone, &GoalBelief, &MeshMaterial3d<StandardMaterial>)>,
+    drones: Query<(&Drone, &GoalBelief, &ColorMat)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for (drone, gb, mat_handle) in &drones {
+    for (drone, gb, color_mat) in &drones {
         let obs = snap.0[drone.id];
         let speed_t = (obs.vel.length() / MAX_SPEED).clamp(0.0, 1.0);
         let knows = gb.var < GOAL_USABLE_VAR;
-        if let Some(mat) = materials.get_mut(&mat_handle.0) {
+        if let Some(mat) = materials.get_mut(&color_mat.0) {
             mat.base_color = drone_color(drone.informed, knows, speed_t);
             mat.emissive = drone_emissive(drone.informed, knows, speed_t);
         }
+    }
+}
+
+/// Spin the rotor blades so the quads look alive.
+fn spin_rotors(time: Res<Time>, sim: Res<SimState>, mut rotors: Query<&mut Transform, With<Rotor>>) {
+    if sim.paused {
+        return;
+    }
+    let d = ROTOR_SPEED * time.delta_secs();
+    for mut t in &mut rotors {
+        t.rotate_local_y(d);
     }
 }
 
@@ -1726,11 +1803,11 @@ fn drone_emissive(informed: bool, knows_goal: bool, speed_t: f32) -> LinearRgba 
 }
 
 fn orbit_camera(time: Res<Time>, mut cam: Query<&mut Transform, With<Camera3d>>) {
-    let t = time.elapsed_secs() * 0.12;
-    let r = 30.0;
+    let t = time.elapsed_secs() * 0.1;
+    let r = 20.0;
     for mut tf in &mut cam {
-        tf.translation = Vec3::new(t.sin() * r, 17.0, t.cos() * r);
-        tf.look_at(Vec3::new(0.0, 7.5, 0.0), Vec3::Y);
+        tf.translation = Vec3::new(t.sin() * r, 11.0, t.cos() * r);
+        tf.look_at(Vec3::new(0.0, 8.5, 0.0), Vec3::Y);
     }
 }
 
