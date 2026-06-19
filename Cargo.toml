@@ -1,0 +1,17 @@
+[package]
+name = "avian_playground"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.18"
+avian3d = "0.6"
+rand = "0.8"
+nalgebra = "0.34"
+
+# Compile dependencies with optimizations even in dev for a smooth framerate.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
