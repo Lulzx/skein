@@ -43,7 +43,9 @@ const MAX_SPEED: f32 = 7.0;
 // fight real gravity; the battery caps available thrust and drains with use.
 const GRAVITY_ACCEL: f32 = 9.81; // m/s^2
 const THRUST_MAX: f32 = 26.0; // m/s^2 of thrust at full battery (~2.6 g)
-const TILT_RATE: f32 = 6.0; // rad/s, how fast the quad can redirect its thrust
+const TILT_RATE: f32 = 8.0; // rad/s, how fast the quad can redirect its thrust
+const VEL_KP: f32 = 4.0; // velocity-controller gain (1/s)
+const MAX_LATERAL_ACCEL: f32 = 14.0; // m/s^2 cap on commanded steering accel
 const BATTERY_DRAIN: f32 = 0.0016; // per (m/s^2 thrust)·s
 const BATTERY_RECHARGE: f32 = 0.012; // per s (idle trickle / resupply)
 const BATTERY_MIN: f32 = 0.55; // floor — still leaves enough thrust to hover
@@ -1304,14 +1306,16 @@ fn actuate_swarm(
             v_pref
         };
 
-        // Desired net acceleration to reach the chosen velocity this step.
-        let mut accel = (v_new - v_cur) / dt;
+        // Velocity controller: a bounded proportional acceleration toward the
+        // target velocity. (Reaching it in one timestep would demand absurd
+        // accelerations and permanently saturate the thrust.)
         let act_std = if sim.noise { ACTUATION_NOISE_STD } else { 0.0 };
-        accel += Vec3::new(
-            gauss(&mut rng, act_std),
-            gauss(&mut rng, act_std),
-            gauss(&mut rng, act_std),
-        );
+        let accel = ((v_new - v_cur) * VEL_KP).clamp_length_max(MAX_LATERAL_ACCEL)
+            + Vec3::new(
+                gauss(&mut rng, act_std),
+                gauss(&mut rng, act_std),
+                gauss(&mut rng, act_std),
+            );
 
         // --- Quadrotor: realize that as tilt- and battery-limited thrust -------
         // Net accel = thrust + gravity, so the thrust must also counter gravity.
